@@ -1,0 +1,997 @@
+---
+title: "Volatility & Macro Correlation (R) — Full Walkthrough (with Regimes & Backtest)"
+format:
+  html:
+    toc: true
+    number-sections: true
+    code-fold: false
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+## 1. Objective
+
+### What is this project?
+
+We study the interaction between:
+
+-   **Equity volatility proxies** (1M and 1Y volatility measures)
+-   **Macro variables** (inflation, GDP growth, unemployment, policy
+    rate)
+-   **Forward equity returns** (a simple “next period” return, provided
+    in the dataset)
+
+We use **two instructor-provided datasets**:
+
+-   `data_full`: broad panel (many stocks over time) with `Vol_1M` and
+    basic fundamentals.
+-   `spx_macro`: panel enriched with macro variables and `fwd_return`.
+
+### Why do we do it?
+
+If volatility is linked to macro conditions, we can:
+
+1)  describe **volatility cycles** (time-series)
+2)  identify **macro/volatility regimes**
+3)  test whether a **simple hedge/tilt** performs differently across
+    regimes
+
+> Important note about “Volatility Smile”\
+> A *true* implied-volatility smile needs option chains
+> (strike/maturity/call-put).\
+> Here we **do not** have option chains; we therefore work with
+> **volatility proxies** (`vol_1m`, `vol_1y`) and macro data.
+
+------------------------------------------------------------------------
+
+## 2. Setup
+
+### What is this block?
+
+We load packages, create output folders, and load the `.RData` files.
+
+### Why do we do it?
+
+-   Packages provide the main data and plotting tools.
+-   Output folders make the project reproducible (figures/tables saved
+    to disk).
+-   Loading `.RData` gives access to the instructor datasets.
+
+```{r}
+# -------------------------------
+# 2.1 Packages (install if needed)
+# -------------------------------
+
+# List packages we will use (minimal and common)
+pkgs <- c(
+  "tidyverse",  # dplyr + ggplot2 + readr + etc. + %>%
+  "lubridate",  # date helpers
+  "zoo",        # rolling windows
+  "broom"       # tidy regression outputs
+)
+
+# Install any missing packages (run once on a new machine)
+missing_pkgs <- pkgs[!pkgs %in% rownames(installed.packages())]  # check installed packages
+if (length(missing_pkgs) > 0) {                                  # if some are missing
+  install.packages(missing_pkgs)                                  # install them
+}
+
+# Load packages into the session
+library(tidyverse)   # loads dplyr/ggplot2/readr/purrr/tibble + pipe operator %>%
+library(lubridate)   # date parsing and helpers
+library(zoo)         # rollapply for rolling correlations
+library(broom)       # tidy() for regression outputs
+
+# --------------------------------
+# 2.2 Project output directories
+# --------------------------------
+
+dir.create("output", showWarnings = FALSE, recursive = TRUE)          # main output directory
+dir.create("output/figures", showWarnings = FALSE, recursive = TRUE)  # saved plots
+dir.create("output/tables", showWarnings = FALSE, recursive = TRUE)   # saved tables
+
+# -------------------------------
+# 2.3 Load the instructor datasets
+# -------------------------------
+
+load("data/raw/data_full.RData")   # loads object: data_full (expected)
+load("data/raw/spx_macro.RData")   # loads object: spx_macro (expected)
+
+# -------------------------------
+# 2.4 Quick sanity checks
+# -------------------------------
+
+stopifnot(exists("data_full"))     # stop if object doesn't exist
+stopifnot(exists("spx_macro"))     # stop if object doesn't exist
+
+glimpse(data_full)                 # inspect columns/types quickly
+glimpse(spx_macro)                 # inspect columns/types quickly
+```
+
+### Key observation (from `glimpse()`)
+
+-   `data_full` contains `Tick`, `Date`, `Close`, `Vol_1M` (and
+    fundamentals).\
+-   `spx_macro` contains `symbol`, `sector`, `date`, `vol_1y`,
+    `fwd_return` and macro variables.
+
+### Limitations
+
+-   Variable names differ in capitalization (`Vol_1M` vs `vol_1y`). We
+    standardize them next.
+
+------------------------------------------------------------------------
+
+## 3. Standardize columns and build “clean” datasets
+
+### What is this block?
+
+We rename columns to lowercase to avoid case issues, and keep only
+columns we need.
+
+### Why do we do it?
+
+-   Lowercase column names reduce mistakes (`Date` vs `date`).
+-   Creating “analysis tables” makes downstream steps simpler and
+    reproducible.
+
+```{r}
+# -----------------------------------------
+# 3.1 Standardize column names to lowercase
+# -----------------------------------------
+
+df1 <- data_full %>% rename_with(tolower)  # make all names lowercase (data_full)
+df2 <- spx_macro %>% rename_with(tolower)  # make all names lowercase (spx_macro)
+
+# -------------------------------------------------------
+# 3.2 Build a clean volatility panel from data_full (df1)
+# -------------------------------------------------------
+
+# Keep only the essentials: identifier, date, close, 1M volatility
+vol_panel <- df1 %>%
+  mutate(date = as.Date(date)) %>%         # ensure Date type
+  transmute(
+    tick   = tick,                         # stock identifier
+    date   = date,                         # date
+    close  = close,                        # close price
+    vol_1m = vol_1m                        # 1M volatility proxy
+  ) %>%
+  filter(!is.na(date)) %>%                 # remove rows with missing date
+  filter(!is.na(vol_1m))                   # keep rows where vol is available
+
+# -------------------------------------------------------
+# 3.3 Build a clean macro panel from spx_macro (df2)
+# -------------------------------------------------------
+
+macro_panel <- df2 %>%
+  mutate(date = as.Date(date)) %>%         # ensure Date type
+  transmute(
+    symbol       = symbol,                 # stock identifier
+    sector       = sector,                 # sector label
+    date         = date,                   # date
+    close        = close,                  # close price
+    vol_1y       = vol_1y,                 # 1Y volatility proxy
+    ret          = `return`,               # realized return (current period)
+    fwd_return   = fwd_return,             # forward return (next period)
+    inflation    = inflation,              # macro: inflation
+    gdp_growth   = gdp_growth,             # macro: GDP growth
+    unemployment = unemployment,           # macro: unemployment
+    fed_rate     = fed_rate                # macro: policy rate
+  ) %>%
+  filter(!is.na(date)) %>%                 # remove missing date
+  filter(!is.na(fwd_return))               # forward return is required later
+```
+
+### Key observation
+
+-   We now have two consistent tables: `vol_panel` and `macro_panel`.
+
+### Limitations
+
+-   Any row with missing `fwd_return` is removed, which can reduce
+    sample size.
+-   Macro variables may contain NAs; we handle them later (e.g.,
+    correlations/regressions need complete pairs).
+
+------------------------------------------------------------------------
+
+## 4. Volatility distribution (cross-sectional)
+
+### What is this block?
+
+We visualize the distribution of 1M volatility across all stocks/dates.
+
+### Why do we do it?
+
+Volatility distributions often have: - strong right tails (rare extreme
+values) - outliers that make a standard histogram unreadable
+
+So we plot: 1) **raw distribution** (may be dominated by outliers) 2)
+**trimmed distribution** (better readability; outliers removed from
+*plot only*)
+
+```{r}
+# ---------------------------------------------------------
+# 4.1 Raw histogram (may be distorted by extreme outliers)
+# ---------------------------------------------------------
+
+p_hist_raw <- vol_panel %>%
+  ggplot(aes(x = vol_1m)) +                         # map vol_1m to x-axis
+  geom_histogram(bins = 60) +                       # histogram with 60 bins
+  labs(
+    title = "Distribution of 1M Volatility (raw)",
+    subtitle = "Raw histogram: extreme outliers can compress the main mass",
+    x = "vol_1m",
+    y = "count"
+  )
+
+p_hist_raw
+```
+
+### Key observation
+
+If the histogram looks “flat” with most bars near zero, it usually means
+**a few huge outliers** stretch the x-axis.
+
+### Interpretation
+
+-   Volatility is **right-skewed**: most observations are in a moderate
+    range, with rare very high values.
+
+### Limitations
+
+-   A raw histogram can hide the main distribution because of outliers.
+
+```{r}
+# ---------------------------------------------------------
+# 4.2 Trimmed histogram (improved readability)
+#     NOTE: outliers excluded from plot ONLY (not from data)
+# ---------------------------------------------------------
+
+# Compute 1% and 99% quantiles for plotting range
+q <- quantile(vol_panel$vol_1m, probs = c(0.01, 0.99), na.rm = TRUE)  # quantiles
+
+p_hist_trim <- vol_panel %>%
+  filter(vol_1m >= q[1], vol_1m <= q[2]) %>%        # keep middle 98% for plotting
+  ggplot(aes(x = vol_1m)) +                         # map vol_1m to x-axis
+  geom_histogram(bins = 60) +                       # histogram with 60 bins
+  labs(
+    title = "Distribution of 1M Volatility (trimmed to 1%–99%)",
+    subtitle = "Zoomed view for readability (outliers excluded from plot only)",
+    x = "vol_1m",
+    y = "count"
+  )
+
+p_hist_trim
+```
+
+### Key observation
+
+Now the bulk shape becomes visible (peak + long tail).
+
+### Interpretation
+
+-   Many observations cluster around a “typical” vol range.
+-   Tail risk exists: a smaller set of observations has much higher
+    volatility.
+
+### Limitations
+
+-   Trimming is purely visual; it can mislead if the reader forgets that
+    outliers exist.
+
+------------------------------------------------------------------------
+
+## 5. Market-wide volatility proxy over time
+
+### What is this block?
+
+We compute a time-series proxy of “market volatility” as:
+
+\[ \text{avg\_vol\_1m}(t) = \frac{1}{N_t}\sum\_{i=1}\^{N_t}
+vol\_{1m,i}(t) \]
+
+### Why do we do it?
+
+A market-wide volatility proxy helps us: - detect volatility regimes
+(calm vs crisis) - compare with macro variables later
+
+```{r}
+# ---------------------------------------------------------
+# 5.1 Build the market volatility proxy (average vol_1m)
+# ---------------------------------------------------------
+
+vol_ts <- vol_panel %>%
+  group_by(date) %>%                               # group by date
+  summarise(
+    avg_vol_1m = mean(vol_1m, na.rm = TRUE),        # cross-sectional average volatility
+    n          = n(),                               # number of observations that day
+    .groups    = "drop"                             # return a normal tibble
+  ) %>%
+  arrange(date)                                    # sort by date
+
+# ---------------------------------------------------------
+# 5.2 Plot the market volatility proxy
+# ---------------------------------------------------------
+
+p_vol_ts <- vol_ts %>%
+  ggplot(aes(x = date, y = avg_vol_1m)) +           # date on x, avg vol on y
+  geom_line() +                                     # line plot
+  labs(
+    title = "Market-wide volatility proxy (average vol_1m across stocks)",
+    x = NULL,
+    y = "avg_vol_1m"
+  )
+
+p_vol_ts
+```
+
+### Key observation
+
+You should see spikes during crisis periods (e.g., 2008–2009, 2020).
+
+### Interpretation
+
+-   Volatility clusters: calm periods followed by high-volatility
+    bursts.
+-   These bursts often coincide with macro stress.
+
+### Limitations
+
+-   Equal-weight averaging gives the same weight to small and large
+    firms.
+-   Alternative: value-weighted average using market cap (not done
+    here).
+
+------------------------------------------------------------------------
+
+## 6. Macro variables: a clean monthly macro time series
+
+### What is this block?
+
+We build a **macro time series** (one row per date) by taking the first
+available macro values per date.
+
+### Why do we do it?
+
+Macro variables are repeated across many stocks on the same date in
+`spx_macro`. For correlation analysis, we want **one macro row per
+date**.
+
+```{r}
+# ---------------------------------------------------------
+# 6.1 Extract a macro-only time series (one row per date)
+# ---------------------------------------------------------
+
+macro_ts <- macro_panel %>%
+  group_by(date) %>%                               # group by date
+  summarise(
+    inflation    = first(na.omit(inflation)),       # take first non-NA inflation
+    gdp_growth   = first(na.omit(gdp_growth)),      # take first non-NA GDP growth
+    unemployment = first(na.omit(unemployment)),    # take first non-NA unemployment
+    fed_rate     = first(na.omit(fed_rate)),        # take first non-NA policy rate
+    .groups      = "drop"                           # return a normal tibble
+  ) %>%
+  arrange(date)                                    # sort by date
+
+# ---------------------------------------------------------
+# 6.2 Basic summary statistics (sanity check)
+# ---------------------------------------------------------
+
+summary(macro_ts)                                   # quick descriptive stats
+```
+
+### Key observation
+
+-   Some macro series can contain NAs for early dates.
+-   Ranges may look unusual if values are in “percent points” or scaled
+    units (depends on instructor data).
+
+### Limitations
+
+-   Using `first(na.omit(x))` assumes macro is constant across stocks
+    within each date.
+-   If macro differs across stocks (should not happen), this would hide
+    that inconsistency.
+
+------------------------------------------------------------------------
+
+## 7. Rolling correlation: macro vs market volatility
+
+### What is this block?
+
+We compute **rolling correlations** between each macro variable and the
+market volatility proxy.
+
+### Why do we do it?
+
+Correlations are not stable over time. Rolling correlations reveal: -
+regime changes - periods where macro-vol links strengthen/weaken
+
+```{r}
+# ---------------------------------------------------------
+# 7.1 Merge macro time series with market volatility
+# ---------------------------------------------------------
+
+macro_vol <- vol_ts %>%
+  inner_join(macro_ts, by = "date") %>%            # keep dates common to both
+  arrange(date)                                    # sort by date
+
+# ---------------------------------------------------------
+# 7.2 Rolling correlation function
+# ---------------------------------------------------------
+
+roll_corr <- function(x, y, width = 60) {           # define a helper function
+  zoo::rollapply(                                   # apply over rolling windows
+    data = cbind(x, y),                              # combine as a 2-col matrix
+    width = width,                                   # window length
+    FUN = function(m) cor(m[, 1], m[, 2], use = "complete.obs"), # correlation
+    by.column = FALSE,                               # treat matrix as one object
+    align = "right",                                 # right-aligned (uses past)
+    fill = NA                                        # pad beginning with NA
+  )
+}
+
+# ---------------------------------------------------------
+# 7.3 Compute rolling correlations for each macro variable
+# ---------------------------------------------------------
+
+macro_vol <- macro_vol %>%
+  mutate(
+    corr_vol_inflation    = roll_corr(avg_vol_1m, inflation,    width = 60),
+    corr_vol_gdp_growth   = roll_corr(avg_vol_1m, gdp_growth,   width = 60),
+    corr_vol_unemployment = roll_corr(avg_vol_1m, unemployment, width = 60),
+    corr_vol_fed_rate     = roll_corr(avg_vol_1m, fed_rate,     width = 60)
+  )
+
+# ---------------------------------------------------------
+# 7.4 Plot rolling correlations (facet plot)
+# ---------------------------------------------------------
+
+corr_long <- macro_vol %>%
+  select(date, starts_with("corr_vol_")) %>%        # keep date + corr columns
+  pivot_longer(
+    cols = starts_with("corr_vol_"),                # pivot correlation columns
+    names_to = "series",                            # name column
+    values_to = "corr"                              # value column
+  ) %>%
+  filter(!is.na(corr))                              # drop leading NA windows
+
+p_roll_corr <- corr_long %>%
+  ggplot(aes(x = date, y = corr)) +                 # date vs correlation
+  geom_line() +                                     # line
+  facet_wrap(~ series, ncol = 1, scales = "free_y") + # one panel per series
+  labs(
+    title = "60-day rolling correlation: macro variables vs market volatility",
+    x = NULL,
+    y = "correlation"
+  )
+
+p_roll_corr
+```
+
+### Key observation
+
+Correlations vary over time; you may see sign changes.
+
+### Interpretation
+
+-   If the correlation becomes strongly positive/negative during crises,
+    it suggests macro stress is tightly linked to volatility then.
+-   Different macro variables can matter in different periods.
+
+### Limitations
+
+-   Rolling correlation is descriptive; it does not imply causality.
+-   Window choice (60 days) is arbitrary; results can differ with 30/90
+    days.
+
+------------------------------------------------------------------------
+
+## 8. Regime detection (k-means clustering)
+
+### What is this block?
+
+We define simple “regimes” by clustering on: - market volatility
+(`avg_vol_1m`) - macro variables (inflation, GDP growth, unemployment,
+fed rate)
+
+### Why do we do it?
+
+Regimes simplify analysis: - “high vol + weak growth” vs “low vol +
+normal growth” - later we can compare strategy performance across
+regimes
+
+```{r}
+# ---------------------------------------------------------
+# 8.1 Prepare features for clustering
+# ---------------------------------------------------------
+
+regime_df <- macro_vol %>%
+  select(date, avg_vol_1m, inflation, gdp_growth, unemployment, fed_rate) %>% # select features
+  drop_na()                                          # k-means needs complete cases
+
+# Standardize features (important for k-means)
+X <- regime_df %>%
+  select(-date) %>%                                  # remove date
+  scale()                                            # standardize to mean 0, sd 1
+
+# ---------------------------------------------------------
+# 8.2 Run k-means (k = 3)
+# ---------------------------------------------------------
+
+set.seed(42)                                         # for reproducibility
+km <- kmeans(X, centers = 3, nstart = 25)             # k-means clustering
+
+regime_df <- regime_df %>%
+  mutate(regime = factor(km$cluster))                 # attach cluster labels
+
+# ---------------------------------------------------------
+# 8.3 Plot regimes on top of volatility
+# ---------------------------------------------------------
+
+p_regime <- regime_df %>%
+  ggplot(aes(x = date, y = avg_vol_1m)) +             # date vs volatility
+  geom_line() +                                       # volatility line
+  geom_point(aes(color = regime), size = 1.8) +       # regime points
+  labs(
+    title = "Macro/Volatility regimes (k-means) overlaid on volatility",
+    x = NULL,
+    y = "avg_vol_1m",
+    color = "regime"
+  )
+
+p_regime
+```
+
+### Key observation
+
+One regime will typically map to “spike” periods (high volatility).
+
+### Interpretation
+
+-   Regimes are data-driven clusters: they represent typical
+    combinations of macro + vol.
+-   A regime with **high avg volatility** often corresponds to
+    recessions/stress.
+
+### Limitations
+
+-   k-means assumes spherical clusters and depends on scaling.
+-   `k=3` is arbitrary; other k values may fit better.
+
+```{r}
+# ---------------------------------------------------------
+# 8.4 Summarize regimes (mean macro/vol by cluster)
+# ---------------------------------------------------------
+
+regime_summary <- regime_df %>%
+  group_by(regime) %>%                               # group by regime
+  summarise(
+    avg_vol           = mean(avg_vol_1m, na.rm = TRUE),        # mean volatility
+    mean_inflation    = mean(inflation, na.rm = TRUE),         # mean inflation
+    mean_gdp_growth   = mean(gdp_growth, na.rm = TRUE),        # mean GDP growth
+    mean_unemployment = mean(unemployment, na.rm = TRUE),      # mean unemployment
+    mean_fed_rate     = mean(fed_rate, na.rm = TRUE),          # mean fed rate
+    n                 = n(),                                   # count observations
+    .groups           = "drop"                                 # return tibble
+  ) %>%
+  arrange(regime)                                    # sort by regime id
+
+regime_summary                                       # print table
+write_csv(regime_summary, "output/tables/regime_summary.csv")  # save to CSV
+```
+
+### Key observation
+
+You can label regimes qualitatively based on the averages (e.g., “high
+vol / weak growth”).
+
+### Limitations
+
+-   These are *sample averages*; regime interpretation may be unstable
+    if sample changes.
+
+------------------------------------------------------------------------
+
+## 9. Baseline regression: what drives forward returns?
+
+### What is this block?
+
+We run a simple pooled linear regression:
+
+\[ fwd_return = \alpha + \beta\_1 vol\_{1y} + \beta\_2 inflation +
+\beta\_3 gdp_growth + \beta\_4 unemployment + \beta\_5 fed_rate +
+\varepsilon \]
+
+### Why do we do it?
+
+This is a basic “sanity check” to see: - which variables correlate with
+forward returns (in-sample) - the *direction* of association
+
+```{r}
+# ---------------------------------------------------------
+# 9.1 Build the regression dataset (complete cases)
+# ---------------------------------------------------------
+
+model_df <- macro_panel %>%
+  select(
+    fwd_return,                                      # dependent variable
+    vol_1y,                                          # volatility proxy
+    inflation, gdp_growth, unemployment, fed_rate     # macro features
+  ) %>%
+  drop_na()                                          # keep complete rows only
+
+summary(model_df$fwd_return)                          # quick check of forward returns distribution
+
+# ---------------------------------------------------------
+# 9.2 Fit the pooled regression model
+# ---------------------------------------------------------
+
+reg_fit <- lm(
+  fwd_return ~ vol_1y + inflation + gdp_growth + unemployment + fed_rate,  # formula
+  data = model_df                                                         # dataset
+)
+
+print(summary(reg_fit))                             # print regression results (explicit)
+
+# ---------------------------------------------------------
+# 9.3 Tidy coefficients for easier reporting
+# ---------------------------------------------------------
+
+coef_tbl <- broom::tidy(reg_fit) %>%                # tidy regression output
+  arrange(p.value)                                  # sort by p-value (most significant first)
+
+coef_tbl                                             # print coefficient table
+write_csv(coef_tbl, "output/tables/regression_coefficients.csv")  # save to CSV
+```
+
+### Key observations (how to read the output)
+
+-   **Sign** of each coefficient: direction of association with
+    `fwd_return`.
+-   **p-value**: statistical significance (in-sample).
+-   **R²**: explanatory power.
+
+### Interpretation (what your output suggests)
+
+In your results (as shown in the HTML output):
+
+-   `vol_1y`, `inflation`, `unemployment`, `fed_rate` show **positive**
+    coefficients.
+-   `gdp_growth` shows a **negative** coefficient (small magnitude).
+-   The **R² is very low** (\~0.003–0.004): macro + vol explain only a
+    tiny fraction of cross-sectional forward returns.
+
+This is common in equity panels: forward returns are noisy and hard to
+explain with a few macro variables.
+
+### Limitations
+
+-   Pooled OLS ignores fixed effects (stock/sector/time).
+-   Macros are mostly time-series, while returns are stock-level →
+    strong residual noise.
+-   Statistical significance can be driven by huge sample size.
+
+```{r}
+# ---------------------------------------------------------
+# 9.4 Plot regression coefficient estimates (excluding intercept)
+# ---------------------------------------------------------
+
+p_coef <- coef_tbl %>%
+  filter(term != "(Intercept)") %>%                  # remove intercept for plot clarity
+  ggplot(aes(x = reorder(term, estimate), y = estimate)) +  # order bars by estimate
+  geom_col() +                                       # bar chart
+  coord_flip() +                                     # horizontal bars
+  labs(
+    title = "Regression coefficients (impact on forward returns)",
+    x = NULL,
+    y = "estimate"
+  )
+
+p_coef
+ggsave("output/figures/regression_coefficients.png", p_coef, width = 9, height = 5)
+```
+
+### Key observation
+
+This plot is a visual ranking of coefficients (not necessarily
+“importance”).
+
+### Limitation
+
+Coefficients are in different units (inflation points vs rate points),
+so comparing magnitudes can be misleading.
+
+------------------------------------------------------------------------
+
+## 10. Backtest: simple low-vol vs high-vol strategy
+
+### What is this block?
+
+We test a simple **cross-sectional strategy** at each rebalancing date:
+
+1)  Sort stocks by `vol_1y` (risk proxy / volatility level)\
+2)  Build portfolios equal-weight portfolios:
+    -   **Low-vol**: bottom 20%
+    -   **High-vol**: top 20%
+3)  Use `fwd_return` as the *next-period* realized return for each
+    stock\
+4)  Compute:
+    -   long-only Low-vol
+    -   long-only High-vol
+    -   **Long-Short (Low − High)**
+
+### Why do we do it?
+
+To check if: - To check whether a classic “low-volatility effect” is
+present in the dataset (i.e., low-vol outperforming high-vol). - To
+understand how performance behaves across market regimes (calm vs
+stress). - To provide an economic complement to
+correlations/regressions: even if a relation exists statistically, is it
+meaningful in a tradable portfolio setting?
+
+```{r}
+# ------------------------------------------------------------
+# 10.1 Prepare strategy universe (needed columns only)
+# ------------------------------------------------------------
+
+bt_universe <- macro_panel %>%                                  # start from the merged panel dataset
+  select(date, symbol, vol_1y, fwd_return) %>%                  # keep only what the backtest needs
+  drop_na(vol_1y, fwd_return) %>%                               # require both volatility and forward return
+  arrange(date, symbol)                                         # sort for stable and reproducible results
+
+# ------------------------------------------------------------
+# 10.2 Assign vol-quantile buckets by date (bottom/top 20%)
+# ------------------------------------------------------------
+
+bt_buckets <- bt_universe %>%                                   # use the universe built in 10.1
+  group_by(date) %>%                                            # form cross-sectional buckets each date
+  mutate(
+    q20 = quantile(vol_1y, 0.20, na.rm = TRUE),                  # compute 20th percentile of vol (low-vol cutoff)
+    q80 = quantile(vol_1y, 0.80, na.rm = TRUE),                  # compute 80th percentile of vol (high-vol cutoff)
+    bucket = case_when(
+      vol_1y <= q20 ~ "low_vol",                                 # bottom 20% volatility names
+      vol_1y >= q80 ~ "high_vol",                                # top 20% volatility names
+      TRUE        ~ "mid"                                        # middle 60% (not used in long-short)
+    )
+  ) %>%
+  ungroup()                                                     # remove date grouping
+
+# ------------------------------------------------------------
+# 10.3 Compute portfolio returns (equal-weight) by date
+# ------------------------------------------------------------
+
+bt_ports <- bt_buckets %>%                                      # start from bucketed data
+  filter(bucket %in% c("low_vol", "high_vol")) %>%              # keep only the two tails (20/80)
+  group_by(date, bucket) %>%                                    # compute portfolio return per date and bucket
+  summarize(
+    port_ret = mean(fwd_return, na.rm = TRUE),                   # equal-weight average forward return
+    n_names  = n(),                                              # number of stocks in the bucket
+    .groups  = "drop"                                            # drop grouping after summarize
+  ) %>%
+  pivot_wider(
+    names_from  = bucket,                                        # create columns: low_vol, high_vol
+    values_from = port_ret                                       # values are portfolio returns
+  ) %>%
+  mutate(
+    ls_ret = low_vol - high_vol                                  # long-short return: low minus high
+  ) %>%
+  arrange(date)                                                 # sort by date
+
+# ------------------------------------------------------------
+# 10.4 Convert to cumulative performance (simple compounding)
+# ------------------------------------------------------------
+
+scale_check <- median(abs(bt_ports$high_vol), na.rm = TRUE)      # typical magnitude of high-vol returns
+
+if (is.finite(scale_check) && scale_check > 0.5) {               # if returns look like percentages (e.g., 2 = 2%)
+  bt_ports <- bt_ports %>%                                       # rescale everything consistently
+    mutate(
+      low_vol  = low_vol  / 100,                                 # convert % -> decimal
+      high_vol = high_vol / 100,                                 # convert % -> decimal
+      ls_ret   = ls_ret   / 100                                  # convert % -> decimal
+    )
+}
+
+bt_cum <- bt_ports %>%                                           # start from rescaled returns
+  mutate(
+    cum_low  = cumprod(1 + low_vol)  - 1,                        # compounded cumulative return for low-vol
+    cum_high = cumprod(1 + high_vol) - 1,                        # compounded cumulative return for high-vol
+    cum_ls   = cumprod(1 + ls_ret)   - 1                         # compounded cumulative return for long-short
+  )
+
+# ------------------------------------------------------------
+# 10.5 Plot cumulative returns
+# ------------------------------------------------------------
+
+bt_long <- bt_cum %>%                                            # start from cumulative returns dataset
+  select(date, cum_low, cum_high, cum_ls) %>%                    # keep only cumulative series
+  pivot_longer(
+    cols = -date,                                                # pivot all cumulative columns
+    names_to = "strategy",                                       # strategy label
+    values_to = "cum_return"                                     # cumulative value
+  )
+
+p_bt <- ggplot(bt_long, aes(x = date, y = cum_return)) +         # map date to x, cumulative return to y
+  geom_line() +                                                  # draw lines
+  facet_wrap(~ strategy, ncol = 1, scales = "free_y") +          # one panel per strategy (free scale for readability)
+  labs(
+    title = "Backtest (equal-weight): Low vol vs High vol, and Long-Short", # title
+    x = NULL,                                                    # no x label
+    y = "cumulative return"                                      # y label
+  )
+
+p_bt                                                            # display plot
+```
+
+### Key observations (how to read)
+
+-If `cum_low` rises faster than `cum_high`, the sample favors low-vol
+stocks. -If `cum_high` rises faster than `cum_low`, the sample favors
+high-vol stocks. -`cum_ls = cum_low − cum_high`: -Upward trend → Low-vol
+outperforms High-vol. -Downward trend / negative → High-vol outperforms
+Low-vol.
+
+In your results: -`cum_high` dominates `cum_low` strongly. -`cum_ls`
+turns negative early and remains negative. This indicates high-vol
+outperformance in this dataset over the sample.
+
+### Interpretation
+
+This backtest suggests that the dataset rewards riskier
+(high-volatility) stocks more than defensive low-volatility stocks, at
+least in the way the strategy is constructed (equal-weight tails with
+`vol_1y`, using `fwd_return`).
+
+Economically, this can be consistent with: -Risk premia: investors
+demand higher expected returns to hold more volatile stocks. -Rebound /
+crash-recovery effects: high-vol names can surge during recoveries after
+stress periods. -Sample composition: if the universe contains many
+“high-beta/high-vol growth” stocks, the high-vol basket can mechanically
+outperform.
+
+Most importantly: the long-short “Low − High” being negative means the
+classical low-vol anomaly does not dominate here (at least not under
+this exact definition and weighting).
+
+### Limitations
+
+-This backtest is illustrative: no transaction costs no liquidity /
+bid-ask filters no leverage constraints equal-weight portfolios (not
+value-weighted) -`fwd_return` definition matters: If `fwd_return` is
+“next month return”, the strategy is monthly. If it is computed
+differently, the interpretation changes. We assume alignment is correct
+(date t → forward return t+1). -Outliers and scaling: Extreme returns
+can dominate equal-weight means. Percent vs decimal scaling must be
+checked (2 vs 0.02). For robustness, you may want winsorization (e.g.,
+cap returns at 1%/99%). -Look-ahead / availability bias risk: Volatility
+measures must be known at time t (not using future data). Survivorship
+bias can inflate returns if the dataset excludes delisted names.
+
+## 11. Backtest by regime (conditional performance)
+
+### What is this block?
+
+We repeat the same Low-vol / High-vol / Long-Short construction, but we
+condition performance on the macro/volatility regimes (e.g., from
+k-means clustering). For each regime, we compute average returns:
+
+\-`mean_low` = average Low-vol portfolio return in that regime
+-`mean_high` = average High-vol portfolio return in that regime
+-`mean_ls` = average (Low − High) return in that regime -`n_dates` =
+number of dates available in that regime
+
+### Why do we do it?
+
+-Because relationships can be regime-dependent: a strategy may work in
+calm periods but fail in stress periods (or the opposite).
+
+-This provides a simple way to test whether the Low-vol vs High-vol
+spread changes across different macro environments.
+
+```{r}
+# ---------------------------------------------------------
+# 11.1 Map each date to the detected regime
+# ---------------------------------------------------------
+
+date_regime <- regime_df %>%
+  select(date, regime)                               # date -> regime mapping
+
+bt_with_regime <- bt_ports %>%
+  inner_join(date_regime, by = "date") %>%           # attach regime label
+  arrange(date)
+
+# ---------------------------------------------------------
+# 11.2 Average returns by regime
+# ---------------------------------------------------------
+
+bt_reg_summary <- bt_with_regime %>%
+  group_by(regime) %>%                               # group by regime
+  summarise(
+    mean_low  = mean(low_vol,  na.rm = TRUE),         # average low-vol return
+    mean_high = mean(high_vol, na.rm = TRUE),         # average high-vol return
+    mean_ls   = mean(ls_ret,   na.rm = TRUE),         # average long-short return
+    n_dates   = n(),                                  # number of dates in regime
+    .groups   = "drop"
+  ) %>%
+  arrange(regime)
+
+bt_reg_summary                                       # print table
+write_csv(bt_reg_summary, "output/tables/backtest_by_regime.csv")  # save to CSV
+```
+
+### Key observations (how to read)
+
+-If `mean_ls > 0`: Low-vol dominates High-vol in that regime. -If
+`mean_ls < 0`: High-vol dominates Low-vol in that regime. -Always check
+`n_dates`: small sample regimes are noisy.
+
+In your table: -`mean_ls` is negative in all regimes → High-vol
+outperforms Low-vol in each regime. -One regime has very small `n_dates`
+(e.g., 7), so its mean is less reliable.
+
+### Interpretation
+
+The fact that `mean_ls` remains negative across regimes suggests that
+high-vol outperformance is not limited to a single macro regime in your
+sample. However, regime conclusions should be weighted by sample size:
+regimes with very few dates can be driven by a handful of extreme
+observations.
+
+### Limitations
+
+-Regimes from k-means depend on: -chosen variables
+-normalization/scaling -number of clusters (k) Different choices can
+change regime assignment and results.
+
+-The regime analysis is still a simplified backtest: -no costs, no
+liquidity constraints -equal weights -potential outlier sensitivity
+
+------------------------------------------------------------------------
+
+## 12. Final wrap-up: conclusions, limitations, and extensions
+
+### Main takeaways (typical)
+
+1)  Volatility is right-skewed and shows strong clustering over time
+    (few extreme spikes dominate the distribution).
+2)  The macro–volatility link is time-varying: rolling correlations
+    change sign and magnitude across subperiods, which supports a
+    regime-dependent interpretation.
+3)  Simple k-means regimes separate calm vs stress episodes reasonably
+    well and help structure the narrative (e.g., “low-vol calm” vs
+    “high-vol stress” environments).
+4)  The pooled OLS indicates that volatility + macro variables have some
+    statistical association with forward returns, but overall
+    explanatory power remains low (low 𝑅square), which is typical for
+    return prediction.
+5)  The illustrative backtest shows that High-vol outperforms Low-vol in
+    this dataset: cum_high dominates cum_low, and the Long-Short (Low −
+    High) is persistently negative, including when conditioning on
+    regimes (negative mean_ls across regimes).
+
+### Project limitations (important to state)
+
+-No implied-vol smile: no option chain data (strike/maturity), so we use
+volatility proxies only. -Predicting returns is difficult: pooled OLS
+ignores fixed effects/endogeneity and is not causal. -Illustrative
+backtest: no costs/liquidity constraints, equal-weighted, sensitive to
+outliers and return scaling. -Regime fragility: k-means depends on
+scaling and k; small n_dates makes regime averages noisy.
+
+### Extensions (if you want to upgrade the project)
+
+-Use fixed effects or Fama–MacBeth / clustered SE for a stronger panel
+framework. -Compare value-weighted vs equal-weight volatility proxies
+(market cap weighting). -Add robustness checks: winsorize returns, vary
+buckets (20/80 vs 30/70), test 1M vs 1Y vol. -Make the backtest more
+realistic: transaction costs/turnover, realistic rebalancing, report
+Sharpe/drawdown. -Improve regimes (HMM/threshold models) and, with
+option data, build true smile surfaces linked to macro regimes.
